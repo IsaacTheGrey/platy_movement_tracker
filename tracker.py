@@ -113,6 +113,21 @@ try:
             bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
             #bw = cv2.erode(bw, kernel, iterations=1)
 
+            num_lbl, labels, stats, cents = cv2.connectedComponentsWithStats(bw)
+            if num_lbl <= 1:
+                return  # no blobs
+            # get areas of each blob (skip background label 0)
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            idx = int(np.argmax(areas)) + 1
+            if areas[idx-1] < min_area:
+                return
+
+            # centroid in ROI coords
+            cx_blob, cy_blob = cents[idx]
+            # convert to frame coords
+            abs_cx = int(x0c + cx_blob)
+            abs_cy = int(y0c + cy_blob)
+
 
             # accumulate for debug
             debug_mask[y0c:y1c, x0c:x1c] = bw
@@ -128,6 +143,7 @@ try:
 
             # draw on the full frame
             draw_detection_box(frame, x0c, y0c, c, cx, cy, r)
+            cv2.circle(frame, (abs_cx, abs_cy), 4, (0,0,255), -1)
 
         # fire off per‐well in a thread pool
         with ThreadPoolExecutor() as executor:
