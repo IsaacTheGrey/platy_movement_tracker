@@ -49,10 +49,10 @@ capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 # ── GUI Setup ─────────────────────────────────────────────────────────────────
 cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
 def nothing(x): pass
-cv2.createTrackbar('Thresh',    'Controls', 110, 255, nothing)
+cv2.createTrackbar('Thresh',    'Controls', 112, 255, nothing)
 cv2.createTrackbar('MinArea',   'Controls',  10, 500, nothing)
-cv2.createTrackbar('ClipLimit', 'Controls',  70, 100, nothing)  # ×0.1
-cv2.createTrackbar('TileSize',  'Controls',  20,  50, nothing)
+cv2.createTrackbar('ClipLimit', 'Controls',  80, 100, nothing)  # ×0.1
+cv2.createTrackbar('TileSize',  'Controls',  19,  50, nothing)
 
 cv2.namedWindow("Detections", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Detections", 800, 800)
@@ -110,7 +110,9 @@ try:
 
             # morphology cleanup
             bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,  kernel, iterations=1)
-            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=2)
+            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+            #bw = cv2.erode(bw, kernel, iterations=1)
+
 
             # accumulate for debug
             debug_mask[y0c:y1c, x0c:x1c] = bw
