@@ -1,17 +1,17 @@
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 def detect_wells(frame):
     """Detect circular wells in the static arena."""
-    gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred  = cv2.medianBlur(gray, 5)
-    circles  = cv2.HoughCircles(
-                   blurred, 
-                   cv2.HOUGH_GRADIENT,
-                   dp=1, minDist=200,
-                   param1=18, param2=16,
-                   minRadius=140, maxRadius=155
-               )
+    gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.medianBlur(gray, 5)
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT,
+        dp=1, minDist=200,
+        param1=16, param2=15,
+        minRadius=140, maxRadius=150
+    )
     wells = []
     if circles is not None:
         circles = np.uint16(np.around(circles))
@@ -19,83 +19,130 @@ def detect_wells(frame):
             wells.append((x, y, r))
     return wells
 
+def draw_detection_box(frame, x0, y0, contour, cx, cy, r):
+    x, y, w, h = cv2.boundingRect(contour)
+    cv2.rectangle(frame, (x0 + x, y0 + y), (x0 + x + w, y0 + y + h), (0,255,0), 2)
+    cv2.circle(frame, (cx, cy), r, (255,0,0), 1)
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
-video_path      = r"c:\Users\federico97\Desktop\20241129_162150\000000.mp4"
-capture         = cv2.VideoCapture(video_path)
+exit_key   = 'q'
+video_path = r"c:\Users\federico97\Desktop\20241129_162150\000000.mp4"
+capture    = cv2.VideoCapture(video_path)
 if not capture.isOpened():
     raise RuntimeError(f"Could not open video {video_path}")
 
-# get first frame → detect wells → build well mask
 ret, first_frame = capture.read()
 if not ret:
     raise RuntimeError("Could not read first frame for well detection")
 
 well_positions = detect_wells(first_frame)
+if not well_positions:
+    raise RuntimeError("No wells detected. Check parameters.")
 print(f"Detected {len(well_positions)} wells")
 
-# draw wells for verification
-for cx, cy, r in well_positions:
-    cv2.circle(first_frame, (cx, cy), r, (0, 0, 255), 2)
-    cv2.circle(first_frame, (cx, cy),   2, (0, 255,   0), 3)
-cv2.imshow("Detected Wells", first_frame)
+# get frame dimensions for ROI clipping
+frame_height, frame_width = first_frame.shape[:2]
 
-# create a binary mask of wells
-well_mask = np.zeros(first_frame.shape[:2], dtype=np.uint8)
-for cx, cy, r in well_positions:
-    cv2.circle(well_mask, (cx, cy), r, 255, thickness=-1)
-
-# reset video
+# rewind
 capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-# create trackbars
+# ── GUI Setup ─────────────────────────────────────────────────────────────────
 cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
 def nothing(x): pass
-cv2.createTrackbar('VarThresh','Controls',32,100,nothing)
-cv2.createTrackbar('MinArea',  'Controls', 10,500,nothing)
+cv2.createTrackbar('Thresh',    'Controls', 112, 255, nothing)
+cv2.createTrackbar('MinArea',   'Controls',  10, 500, nothing)
+cv2.createTrackbar('ClipLimit', 'Controls',  80, 100, nothing)  # ×0.1
+cv2.createTrackbar('TileSize',  'Controls',  19,  50, nothing)
 
-# initialize detector & CLAHE
-object_detector = cv2.createBackgroundSubtractorMOG2(history=300)
-clahe           = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(12,12))
+cv2.namedWindow("Detections", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Detections", 800, 800)
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-while True:
-    ret, frame = capture.read()
-    if not ret:
-        break
+cv2.namedWindow("Enhanced Gray", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Enhanced Gray", 900, 900)
 
-    # get parameters
-    var_thresh = cv2.getTrackbarPos('VarThresh', 'Controls')
-    min_area   = cv2.getTrackbarPos('MinArea',   'Controls')
-    object_detector.setVarThreshold(var_thresh)
+cv2.namedWindow("Threshold Mask", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Threshold Mask", 800, 800)
 
-    # 1) enhance contrast
-    gray       = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    enhanced   = clahe.apply(gray)
-    enhanced   = cv2.GaussianBlur(enhanced, (5,5), 0)
+# static morphology kernel
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
 
-    # 2) background subtraction
-    fg_mask    = object_detector.apply(enhanced)
+# ── Main Loop ─────────────────────────────────────────────────────────────────
+try:
+    while True:
+        ret, frame = capture.read()
+        if not ret:
+            break
 
-    # 3) restrict to wells
-    masked_fg  = cv2.bitwise_and(fg_mask, fg_mask, mask=well_mask)
+        # 1) Read all sliders each frame
+        thresh_val  = cv2.getTrackbarPos('Thresh',    'Controls')
+        min_area    = cv2.getTrackbarPos('MinArea',   'Controls')
+        clip_limit  = cv2.getTrackbarPos('ClipLimit','Controls') / 10.0
+        tile_size   = cv2.getTrackbarPos('TileSize', 'Controls')
+        tile_size   = max(1, tile_size)
 
-    # 4) detect contours
-    contours, _ = cv2.findContours(
-        masked_fg, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_area:
-            continue
-        x,y,w,h = cv2.boundingRect(cnt)
-        cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+        # 2) Configure CLAHE dynamically
+        clahe = cv2.createCLAHE(clipLimit=clip_limit,
+                                tileGridSize=(tile_size, tile_size))
 
-    # 5) display
-    cv2.imshow("Enhanced Gray", enhanced)
-    cv2.imshow("Wells-Masked FG", masked_fg)
-    cv2.imshow("Detections",   frame)
+        # 3) Contrast‐enhance the whole frame
+        gray_full     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        enhanced_full = clahe.apply(gray_full)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # 4) Prepare a mask to show all wells’ binaries
+        debug_mask = np.zeros_like(enhanced_full)
 
-capture.release()
-cv2.destroyAllWindows()
+        # 5) Per‐well processing in parallel
+        def process_well(well):
+            cx, cy, r = well
+            x0, y0 = cx - r, cy - r
+            x1, y1 = cx + r, cy + r
+            # clip to image bounds
+            x0c, y0c = max(x0, 0), max(y0, 0)
+            x1c, y1c = min(x1, frame_width), min(y1, frame_height)
+            roi = enhanced_full[y0c:y1c, x0c:x1c]
+
+            # threshold
+            if thresh_val > 0:
+                _, bw = cv2.threshold(roi, thresh_val, 255, cv2.THRESH_BINARY_INV)
+            else:
+                _, bw = cv2.threshold(roi, 0, 255,
+                    cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+            # morphology cleanup
+            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,  kernel, iterations=1)
+            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
+            #bw = cv2.erode(bw, kernel, iterations=1)
+
+
+            # accumulate for debug
+            debug_mask[y0c:y1c, x0c:x1c] = bw
+
+            # find largest contour
+            cnts, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                return
+            c = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(c) < min_area:
+                return
+
+            # draw on the full frame
+            draw_detection_box(frame, x0c, y0c, c, cx, cy, r)
+
+        # fire off per‐well in a thread pool
+        with ThreadPoolExecutor() as executor:
+            executor.map(process_well, well_positions)
+
+        # 6) Show results
+        cv2.imshow("Enhanced Gray",    enhanced_full)
+        cv2.imshow("Threshold Mask",   debug_mask)
+        cv2.imshow("Detections",       frame)
+
+        # 7) Exit on key
+        if cv2.waitKey(1) & 0xFF == ord(exit_key):
+            break
+
+finally:
+    # always release & destroy
+    capture.release()
+    cv2.destroyAllWindows()
