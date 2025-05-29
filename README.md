@@ -1,10 +1,10 @@
 # Functionality
 Custom movement tracker that:
-- takes a video of a behaviour arena,
-- identifies the wells automatically,
+- loads a video of a behaviour arena (path to be specified in the script)
+- identifies the wells automatically and builds binary masks to filter out any signal coming from outside the wells
 - tracks the biggest object in each well
-- computes the speed of the object in real time
-- saves positions and speeds associated with time stamps in a .csv file for further processing in ActogramJ
+- computes the speed of the object in real time using a minimum movement threshold and a rolling mean over a number of frames decided by the user
+- saves positions and speeds per each well associated with time stamps in a .csv file for further processing in ActogramJ
 
 ## main version
 This version has a GUI and can be used to fine tune the tracking parameters (threshold, grid size...).
