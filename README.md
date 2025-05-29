@@ -16,3 +16,7 @@ This version is meant for computing and has the possibility to skip frames. With
 # Usage
 Open the `tracker.py` script in a python notebook (vscode, jupyter lab...) give the correct path to the video to be tracked and start the scritp. If you are running the main version, a GUI will appear and it will be possible to set parameters in real time to check the effects on the video tracking. 
 If you are running the no-gui-version the script will start immediately and estimate the duration of the processing in the terminal output. Therefore, I recommend adjusting the parameters with the GUI version first, copying them in to the no-gui-version and running the tracking with that. 
+
+
+# Next TO DOs
+- fixing the timestamps: the user should have the possibility to enter the starting time of the experiment and the timestamp for each processed frame should be saved both as epoch time and local time. 
