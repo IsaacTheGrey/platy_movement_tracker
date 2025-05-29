@@ -19,4 +19,6 @@ If you are running the no-gui-version the script will start immediately and esti
 
 
 # Next TO DOs
-- fixing the timestamps: the user should have the possibility to enter the starting time of the experiment and the timestamp for each processed frame should be saved both as epoch time and local time. 
+- fixing the timestamps: the user should have the possibility to enter the starting time of the experiment and the timestamp for each processed frame should be saved both as epoch time and local time.
+- fixing mistake in the number of wells that are printed in the csv file for the no-gui-version
+- fixing the format of the csv file in the gui-version
