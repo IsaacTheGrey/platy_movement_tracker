@@ -6,11 +6,11 @@ Custom movement tracker that:
 - computes the speed of the object in real time using a minimum movement threshold and a rolling mean over a number of frames decided by the user
 - saves positions and speeds per each well associated with time stamps in a .csv file for further processing in ActogramJ
 
-## main version
+## gui-tracker
 This version has a GUI and can be used to fine tune the tracking parameters (threshold, grid size...).
 It can also be used to track, coordinates and speeds are computed between each frame, but it will only be as fast as the real-time video for now.
 
-## no-gui-version
+## no-gui-tracker
 This version is meant for computing and has the possibility to skip frames. Without skipping it should be about twice as fast as real-time. 
 
 # Usage
