@@ -76,11 +76,21 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height, enha
     x1c, y1c = min(x1, frame_width), min(y1, frame_height)
     roi = enhanced_full[y0c:y1c, x0c:x1c]
 
+    # --- make a circular mask the same size as roi ---
+    h, w = roi.shape
+    # center of circle in ROI coords:
+    cy_roi, cx_roi = r, r
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx_roi, cy_roi), r, 255, -1)
+
     # threshold
     if thresh_val > 0:
         _, bw = cv2.threshold(roi, thresh_val, 255, cv2.THRESH_BINARY_INV)
     else:
         _, bw = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # --- apply circular mask so outside-circle is zeroed out ---
+    bw = cv2.bitwise_and(bw, bw, mask=mask)
 
     # morphology cleanup
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
