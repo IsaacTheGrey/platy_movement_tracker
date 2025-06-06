@@ -19,7 +19,7 @@ def detect_wells(frame):
         blurred, cv2.HOUGH_GRADIENT,
         dp=1, minDist=290,
         param1=16, param2=15,
-        minRadius=160, maxRadius=170
+        minRadius=145, maxRadius=145
     )
     wells = []
     if circles is not None:
@@ -104,8 +104,8 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
     bw = cv2.bitwise_and(bw, bw, mask=mask)
 
     # ─── Morphological cleanup ─────────────────────────────────────────────────
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=1)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=2)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=3)
+    #bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     # ─── Find connected components and filter by area ─────────────────────────
     num_lbl, labels, stats, cents = cv2.connectedComponentsWithStats(bw)
@@ -199,7 +199,7 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 exit_key = 'q'
-video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\000000.mp4"
+video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\merged_all.mp4"
 capture = cv2.VideoCapture(video_path)
 if not capture.isOpened():
     raise RuntimeError(f"Could not open video {video_path}")
@@ -245,8 +245,8 @@ print("Saving CSV to:", os.path.abspath(csv_file.name))
 # ── GUI Setup ─────────────────────────────────────────────────────────────────
 cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
 def nothing(x): pass
-cv2.createTrackbar('Thresh',    'Controls', 50, 255, nothing)
-cv2.createTrackbar('MinArea',   'Controls', 1, 500, nothing)
+cv2.createTrackbar('Thresh',    'Controls', 9, 255, nothing)
+cv2.createTrackbar('MinArea',   'Controls', 27, 500, nothing)
 cv2.createTrackbar('MaxArea',   'Controls', 350, 1000, nothing)
 cv2.createTrackbar('ClipLimit', 'Controls', 0, 1000, nothing)  # ×0.01
 
