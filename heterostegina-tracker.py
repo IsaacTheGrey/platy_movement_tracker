@@ -8,8 +8,8 @@ import csv
 import threading
 
 # Constants
-MOVEMENT_THRESHOLD = 10    # Minimum movement in pixels to consider
-ROLLING_WINDOW_SIZE = 2    # Number of frames for rolling mean
+MOVEMENT_THRESHOLD = 1      # Minimum movement in pixels to consider
+ROLLING_WINDOW_SIZE = 1     # Number of frames for rolling mean
 
 def detect_wells(frame):
     """Detect circular wells in the static arena."""
@@ -73,6 +73,8 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
     2. Apply CLAHE *per well*.
     3. Threshold, find blobs, then pick the blob whose centroid is closest to
        last frame's centroid (or largest on first detection).
+    4. Compute and accumulate traveled distance.
+    5. Write CSV row with cumulative distance.
     """
     global well_tracks
 
@@ -86,7 +88,6 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
     roi_gray = gray_full[y0c:y1c, x0c:x1c]
 
     # ─── Apply CLAHE on this ROI ───────────────────────────────────────────────
-    # Fixed tileGridSize per well, e.g., (8,8). Adjust if you want different granularity.
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
     roi_enhanced = clahe.apply(roi_gray)
 
@@ -94,8 +95,10 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
     if thresh_val > 0:
         _, bw = cv2.threshold(roi_enhanced, thresh_val, 255, cv2.THRESH_BINARY_INV)
     else:
-        _, bw = cv2.threshold(roi_enhanced, 0, 255,
-                              cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        _, bw = cv2.threshold(
+            roi_enhanced, 0, 255,
+            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+        )
 
     # ─── Mask out anything outside the well circle ─────────────────────────────
     h, w = roi_enhanced.shape
@@ -105,7 +108,6 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
 
     # ─── Morphological cleanup ─────────────────────────────────────────────────
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=3)
-    #bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     # ─── Find connected components and filter by area ─────────────────────────
     num_lbl, labels, stats, cents = cv2.connectedComponentsWithStats(bw)
@@ -135,21 +137,37 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
     else:
         # Pick the candidate whose centroid is closest to prev_cent
         distances = [
-            (lbl_i,
-             centroid,
-             area,
-             calculate_distance(prev_cent[0], prev_cent[1], centroid[0], centroid[1]))
+            (
+                lbl_i,
+                centroid,
+                area,
+                calculate_distance(prev_cent[0], prev_cent[1], centroid[0], centroid[1])
+            )
             for lbl_i, centroid, area in candidates
         ]
         chosen_label, (cx_blob_rel, cy_blob_rel), _, _ = min(distances, key=lambda x: x[3])
 
-    # Update memory
+    # Update ROI-relative centroid memory
     well_tracks[well_idx]['last_centroid'] = (cx_blob_rel, cy_blob_rel)
 
-    # Convert centroid back to full-frame coordinates
+    # ─── Convert centroid back to full-frame coordinates ───────────────────────
     abs_cx = int(x0c + cx_blob_rel)
     abs_cy = int(y0c + cy_blob_rel)
     t = frame_idx / fps
+
+    # ─── Compute traveled distance this frame (if there was a previous full-frame centroid) ─
+    prev_full = well_tracks[well_idx].get('last_centroid_full', None)
+    if prev_full is not None:
+        dx = abs_cx - prev_full[0]
+        dy = abs_cy - prev_full[1]
+        frame_dist = math.hypot(dx, dy)
+    else:
+        frame_dist = 0.0
+
+    # Update the cumulative total_distance
+    well_tracks[well_idx]['total_distance'] += frame_dist
+    # Save this centroid in full-frame coords for next iteration
+    well_tracks[well_idx]['last_centroid_full'] = (abs_cx, abs_cy)
 
     # ─── Update tracking and write CSV ─────────────────────────────────────────
     well_tracks[well_idx]['positions'].append((t, abs_cx, abs_cy))
@@ -162,6 +180,8 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
         if well_tracks[well_idx]['speeds'] else 0
     )
 
+    total_dist = well_tracks[well_idx]['total_distance']  # cumulative distance so far
+
     with write_lock:
         csv_writer.writerow([
             well_idx,
@@ -169,7 +189,8 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
             abs_cx,
             abs_cy,
             rolling_speed,
-            smoothed_speed
+            smoothed_speed,
+            total_dist
         ])
         csv_file.flush()
 
@@ -199,7 +220,7 @@ def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 exit_key = 'q'
-video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\merged_all.mp4"
+video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\20250523lc1ashdepressa_20250523_171723\downsampled.mp4"
 capture = cv2.VideoCapture(video_path)
 if not capture.isOpened():
     raise RuntimeError(f"Could not open video {video_path}")
@@ -223,12 +244,14 @@ capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 # Grab the frame rate
 fps = capture.get(cv2.CAP_PROP_FPS)
 
-# Initialize well tracks with deques for rolling calculations and 'last_centroid'
+# Initialize well tracks with deques for rolling calculations, 'last_centroid', and 'total_distance'
 well_tracks = {
     i: {
-        'positions':     collections.deque(maxlen=ROLLING_WINDOW_SIZE + 1),
-        'speeds':        collections.deque(maxlen=ROLLING_WINDOW_SIZE),
-        'last_centroid': None
+        'positions':        collections.deque(maxlen=ROLLING_WINDOW_SIZE + 1),
+        'speeds':           collections.deque(maxlen=ROLLING_WINDOW_SIZE),
+        'last_centroid':    None,
+        'last_centroid_full': None,
+        'total_distance':   0.0
     }
     for i in range(len(well_positions))
 }
@@ -237,7 +260,15 @@ frame_idx = 0
 
 csv_file = open("well_centroids.csv", "w", newline="")
 csv_writer = csv.writer(csv_file)
-csv_writer.writerow(["well", "time_s", "x_px", "y_px", "speed_px/s", "smoothed_speed_px/s"])
+csv_writer.writerow([
+    "well",
+    "time_s",
+    "x_px",
+    "y_px",
+    "speed_px/s",
+    "smoothed_speed_px/s",
+    "distance_px"
+])
 write_lock = threading.Lock()
 
 print("Saving CSV to:", os.path.abspath(csv_file.name))
@@ -260,7 +291,7 @@ cv2.namedWindow("Threshold Mask",  cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Threshold Mask", 800, 800)
 
 # Static morphology kernel
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, s3))
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 try:
@@ -307,8 +338,6 @@ try:
             executor.map(lambda args: process_well(*args), tasks)
 
         # 5) Show results
-        # For visualization purposes, we can display the per-well enhanced ROI masks
-        # by showing gray_full (unmodified) alongside the debug_mask and detections.
         cv2.imshow("Enhanced Gray",   gray_full)
         cv2.imshow("Threshold Mask",  debug_mask)
         cv2.imshow("Detections",      frame)
