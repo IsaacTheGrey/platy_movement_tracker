@@ -9,10 +9,10 @@ import threading
 
 # Constants
 MOVEMENT_THRESHOLD = 1      # Minimum movement in pixels to consider
-ROLLING_WINDOW_SIZE = 1     # Number of frames for rolling mean
+FRAME_SKIP = 9              # Number of frames to skip between processed frames
 
+# Detect circular wells in the static arena
 def detect_wells(frame):
-    """Detect circular wells in the static arena."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.medianBlur(gray, 5)
     circles = cv2.HoughCircles(
@@ -28,329 +28,176 @@ def detect_wells(frame):
             wells.append((x, y, r))
     return wells
 
-def draw_detection_box(frame, x0, y0, contour, cx, cy, r):
-    """Draw bounding box around the chosen contour and circle for well."""
-    x, y, w, h = cv2.boundingRect(contour)
-    cv2.rectangle(frame, (x0 + x, y0 + y), (x0 + x + w, y0 + y + h), (0, 255, 0), 2)
-    cv2.circle(frame, (cx, cy), r, (255, 0, 0), 1)
+# Draw bounding box, well circle, and ID label
+def draw_detection_box(frame, well_idx, x0, y0, contour, cx, cy, r, color):
+    x, y, w_, h_ = cv2.boundingRect(contour)
+    cv2.rectangle(frame, (x0 + x, y0 + y), (x0 + x + w_, y0 + y + h_), color, 2)
+    cv2.putText(frame, f"Cell (Well {well_idx})", (x0 + x, y0 + y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    cv2.circle(frame, (cx, cy), r, (0, 255, 255), 2)  # high-contrast yellow circle
 
+# Euclidean distance
 def calculate_distance(x1, y1, x2, y2):
-    """Calculate Euclidean distance between two points."""
     return math.hypot(x2 - x1, y2 - y1)
 
-def calculate_rolling_speed(positions, fps):
-    """Calculate rolling speed based on multiple positions."""
-    if len(positions) < 2:
-        return 0
-
-    total_distance = 0
-    total_time = 0
-
-    # Calculate cumulative distance and time
-    for i in range(1, len(positions)):
-        prev_time, prev_x, prev_y = positions[i - 1]
-        curr_time, curr_x, curr_y = positions[i]
-
-        distance = calculate_distance(prev_x, prev_y, curr_x, curr_y)
-        time_diff = curr_time - prev_time
-
-        # Only count movement above threshold
-        if distance >= MOVEMENT_THRESHOLD:
-            total_distance += distance
-            total_time += time_diff
-
-    # Avoid division by zero
-    if total_time > 0:
-        return total_distance / total_time
-    return 0
-
-def process_well(well_idx, well, frame_idx, fps, frame_width, frame_height,
-                 gray_full, clip_limit, thresh_val, min_area, max_area, kernel,
-                 frame, debug_mask, csv_writer, write_lock):
-    """
-    Process a single well:
-    1. Extract the grayscale ROI.
-    2. Apply CLAHE *per well*.
-    3. Threshold, find blobs, then pick the blob whose centroid is closest to
-       last frame's centroid (or largest on first detection).
-    4. Compute and accumulate traveled distance.
-    5. Write CSV row with cumulative distance.
-    """
-    global well_tracks
-
+# Process a single well for one frame
+def process_well(well_idx, well, t, frame_w, frame_h,
+                 gray_full, clip_limit, thresh_val, min_area, max_area,
+                 kernel, frame, debug_mask, csv_writer, write_lock, color):
+    global well_tracks, csv_file
     cx, cy, r = well
-    # Define bounding-box of square ROI around the circular well
     x0, y0 = cx - r, cy - r
-    x1, y1 = cx + r, cy + r
-    # Clip to image bounds
     x0c, y0c = max(x0, 0), max(y0, 0)
-    x1c, y1c = min(x1, frame_width), min(y1, frame_height)
-    roi_gray = gray_full[y0c:y1c, x0c:x1c]
+    x1c, y1c = min(cx + r, frame_w), min(cy + r, frame_h)
+    roi = gray_full[y0c:y1c, x0c:x1c]
 
-    # ─── Apply CLAHE on this ROI ───────────────────────────────────────────────
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    roi_enhanced = clahe.apply(roi_gray)
+    # CLAHE enhancement
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8,8))
+    enhanced = clahe.apply(roi)
 
-    # ─── Threshold the enhanced ROI (fixed or Otsu) ─────────────────────────────
-    if thresh_val > 0:
-        _, bw = cv2.threshold(roi_enhanced, thresh_val, 255, cv2.THRESH_BINARY_INV)
-    else:
-        _, bw = cv2.threshold(
-            roi_enhanced, 0, 255,
-            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
-        )
+    # threshold
+    _, bw = cv2.threshold(enhanced, thresh_val, 255, cv2.THRESH_BINARY_INV)
 
-    # ─── Mask out anything outside the well circle ─────────────────────────────
-    h, w = roi_enhanced.shape
-    mask = np.zeros((h, w), dtype=np.uint8)
+    # mask outside circle
+    mask = np.zeros_like(bw)
     cv2.circle(mask, (r, r), r, 255, -1)
     bw = cv2.bitwise_and(bw, bw, mask=mask)
 
-    # ─── Morphological cleanup ─────────────────────────────────────────────────
+    # morphology
     bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, kernel, iterations=3)
 
-    # ─── Find connected components and filter by area ─────────────────────────
+    # update debug mask
+    debug_mask[y0c:y1c, x0c:x1c] |= bw
+
+    # connected components
     num_lbl, labels, stats, cents = cv2.connectedComponentsWithStats(bw)
     if num_lbl <= 1:
-        # No blobs detected this frame
+        return
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    centers = cents[1:]
+    lbls = np.arange(1, num_lbl)
+
+    # filter by area
+    candidates = [(lbl, cent, area) for lbl, cent, area in zip(lbls, centers, areas)
+                  if min_area <= area <= max_area]
+    if not candidates:
         return
 
-    all_areas     = stats[1:, cv2.CC_STAT_AREA]
-    all_centroids = cents[1:]
-    all_labels    = np.arange(1, num_lbl)
-
-    # Build list of candidates within [min_area, max_area]
-    candidates = []
-    for lbl_i, area, centroid in zip(all_labels, all_areas, all_centroids):
-        if min_area <= area <= max_area:
-            candidates.append((lbl_i, (centroid[0], centroid[1]), area))
-
-    if not candidates:
-        return  # no blobs within size bounds
-
-    # Retrieve previous centroid (relative to ROI) if exists
-    prev_cent = well_tracks[well_idx]['last_centroid']
-
-    if prev_cent is None:
-        # First detection: pick the largest-area blob
-        chosen_label, (cx_blob_rel, cy_blob_rel), _ = max(candidates, key=lambda x: x[2])
+    # choose candidate by nearest previous
+    prev = well_tracks[well_idx]['last_centroid']
+    if prev is None:
+        chosen_lbl, (cb, cb2), _ = max(candidates, key=lambda x: x[2])
     else:
-        # Pick the candidate whose centroid is closest to prev_cent
-        distances = [
-            (
-                lbl_i,
-                centroid,
-                area,
-                calculate_distance(prev_cent[0], prev_cent[1], centroid[0], centroid[1])
-            )
-            for lbl_i, centroid, area in candidates
-        ]
-        chosen_label, (cx_blob_rel, cy_blob_rel), _, _ = min(distances, key=lambda x: x[3])
+        distances = [(lbl, cent, area, calculate_distance(prev[0], prev[1], cent[0], cent[1]))
+                     for lbl, cent, area in candidates]
+        chosen_lbl, (cb, cb2), _, _ = min(distances, key=lambda x: x[3])
 
-    # Update ROI-relative centroid memory
-    well_tracks[well_idx]['last_centroid'] = (cx_blob_rel, cy_blob_rel)
+    # absolute centroid
+    abs_x = int(x0c + cb)
+    abs_y = int(y0c + cb2)
 
-    # ─── Convert centroid back to full-frame coordinates ───────────────────────
-    abs_cx = int(x0c + cx_blob_rel)
-    abs_cy = int(y0c + cy_blob_rel)
-    t = frame_idx / fps
+    # distance
+    prev_full = well_tracks[well_idx]['last_full']
+    dist = calculate_distance(prev_full[0], prev_full[1], abs_x, abs_y) if prev_full else 0.0
+    well_tracks[well_idx]['last_full'] = (abs_x, abs_y)
+    well_tracks[well_idx]['last_centroid'] = (cb, cb2)
 
-    # ─── Compute traveled distance this frame (if there was a previous full-frame centroid) ─
-    prev_full = well_tracks[well_idx].get('last_centroid_full', None)
-    if prev_full is not None:
-        dx = abs_cx - prev_full[0]
-        dy = abs_cy - prev_full[1]
-        frame_dist = math.hypot(dx, dy)
-    else:
-        frame_dist = 0.0
-
-    # Update the cumulative total_distance
-    well_tracks[well_idx]['total_distance'] += frame_dist
-    # Save this centroid in full-frame coords for next iteration
-    well_tracks[well_idx]['last_centroid_full'] = (abs_cx, abs_cy)
-
-    # ─── Update tracking and write CSV ─────────────────────────────────────────
-    well_tracks[well_idx]['positions'].append((t, abs_cx, abs_cy))
-    rolling_speed = calculate_rolling_speed(
-        list(well_tracks[well_idx]['positions']), fps
-    )
-    well_tracks[well_idx]['speeds'].append(rolling_speed)
-    smoothed_speed = (
-        sum(well_tracks[well_idx]['speeds']) / len(well_tracks[well_idx]['speeds'])
-        if well_tracks[well_idx]['speeds'] else 0
-    )
-
-    total_dist = well_tracks[well_idx]['total_distance']  # cumulative distance so far
-
+    # write csv with timestamp
     with write_lock:
-        csv_writer.writerow([
-            well_idx,
-            t,
-            abs_cx,
-            abs_cy,
-            rolling_speed,
-            smoothed_speed,
-            total_dist
-        ])
+        csv_writer.writerow([well_idx, f"{t:.2f}", f"{dist:.2f}"])
         csv_file.flush()
 
-    # ─── Build a mask for the single chosen blob (for visualization) ───────────
-    single_blob_mask = (labels == chosen_label).astype(np.uint8) * 255
-    debug_mask[y0c:y1c, x0c:x1c] = single_blob_mask
+    # draw box
+    mask_choice = (labels == chosen_lbl).astype(np.uint8)
+    cnts, _ = cv2.findContours(mask_choice, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        draw_detection_box(frame, well_idx, x0c, y0c, cnts[0], cx, cy, r, color)
 
-    cnts, _ = cv2.findContours(single_blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return
-    c = cnts[0]  # only one contour after connectedComponents
+# Setup
+if __name__ == '__main__':
+    video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\full_1frame_per_minute.mp4"
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened(): raise RuntimeError(f"Cannot open {video_path}")
+    ret, first = cap.read()
+    if not ret: raise RuntimeError("Cannot read first frame")
 
-    # ─── Draw box and centroid on the full frame ───────────────────────────────
-    draw_detection_box(frame, x0c, y0c, c, cx, cy, r)
-    cv2.circle(frame, (abs_cx, abs_cy), 4, (0, 0, 255), -1)
+    wells = detect_wells(first)
+    if not wells: raise RuntimeError("No wells found")
+    h, w = first.shape[:2]
+    fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # ─── Overlay speed text and movement path ─────────────────────────────────
-    speed_text = f"{smoothed_speed:.1f} px/s"
-    cv2.putText(frame, speed_text, (abs_cx + 10, abs_cy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    # track state
+    well_tracks = {i: {'last_centroid': None, 'last_full': None} for i in range(len(wells))}
 
-    if len(well_tracks[well_idx]['positions']) > 1:
-        _, last_x, last_y = well_tracks[well_idx]['positions'][-2]
-        cv2.circle(frame, (last_x, last_y), MOVEMENT_THRESHOLD, (0, 255, 255), 1)
-        cv2.line(frame, (last_x, last_y), (abs_cx, abs_cy), (255, 255, 0), 1)
+    # CSV
+    csv_file = open('well_distances.csv', 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['well', 'time_s', 'distance_px'])
+    lock = threading.Lock()
 
+    # video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter('tracked_output.mp4', fourcc, fps/(FRAME_SKIP+1), (w, h))
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
-exit_key = 'q'
-video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\20250523lc1ashdepressa_20250523_171723\downsampled.mp4"
-capture = cv2.VideoCapture(video_path)
-if not capture.isOpened():
-    raise RuntimeError(f"Could not open video {video_path}")
+    # windows
+    cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
+    def nothing(x): pass
+    cv2.createTrackbar('Thresh', 'Controls', 9, 255, nothing)
+    cv2.createTrackbar('MinArea', 'Controls', 27, 1000, nothing)
+    cv2.createTrackbar('MaxArea', 'Controls', 350, 5000, nothing)
+    cv2.createTrackbar('Clip', 'Controls', 0, 500, nothing)
 
-# Read first frame for well detection
-ret, first_frame = capture.read()
-if not ret:
-    raise RuntimeError("Could not read first frame for well detection")
+    cv2.namedWindow('Enhanced Gray', cv2.WINDOW_NORMAL)
+    cv2.namedWindow('Threshold Mask', cv2.WINDOW_NORMAL)
+    cv2.namedWindow('Detections', cv2.WINDOW_NORMAL)
 
-well_positions = detect_wells(first_frame)
-if not well_positions:
-    raise RuntimeError("No wells detected. Check parameters.")
-print(f"Detected {len(well_positions)} wells")
+    # static overlay
+    overlay = np.zeros_like(first)
+    for idx, (cx, cy, r) in enumerate(wells):
+        cv2.circle(overlay, (cx, cy), r, (0, 255, 255), 2)
+        cv2.putText(overlay, str(idx), (cx - 10, cy + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-# Get frame dimensions for ROI clipping
-frame_height, frame_width = first_frame.shape[:2]
+    try:
+        while True:
+            for _ in range(FRAME_SKIP): cap.grab()
+            ret, frame = cap.read()
+            if not ret: break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-# Rewind to first frame
-capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # read controls
+            tv = cv2.getTrackbarPos('Thresh', 'Controls')
+            ma = cv2.getTrackbarPos('MinArea', 'Controls')
+            xa = cv2.getTrackbarPos('MaxArea', 'Controls')
+            cl = cv2.getTrackbarPos('Clip', 'Controls') / 100.0
 
-# Grab the frame rate
-fps = capture.get(cv2.CAP_PROP_FPS)
-
-# Initialize well tracks with deques for rolling calculations, 'last_centroid', and 'total_distance'
-well_tracks = {
-    i: {
-        'positions':        collections.deque(maxlen=ROLLING_WINDOW_SIZE + 1),
-        'speeds':           collections.deque(maxlen=ROLLING_WINDOW_SIZE),
-        'last_centroid':    None,
-        'last_centroid_full': None,
-        'total_distance':   0.0
-    }
-    for i in range(len(well_positions))
-}
-
-frame_idx = 0
-
-csv_file = open("well_centroids.csv", "w", newline="")
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow([
-    "well",
-    "time_s",
-    "x_px",
-    "y_px",
-    "speed_px/s",
-    "smoothed_speed_px/s",
-    "distance_px"
-])
-write_lock = threading.Lock()
-
-print("Saving CSV to:", os.path.abspath(csv_file.name))
-
-# ── GUI Setup ─────────────────────────────────────────────────────────────────
-cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
-def nothing(x): pass
-cv2.createTrackbar('Thresh',    'Controls', 9, 255, nothing)
-cv2.createTrackbar('MinArea',   'Controls', 27, 500, nothing)
-cv2.createTrackbar('MaxArea',   'Controls', 350, 1000, nothing)
-cv2.createTrackbar('ClipLimit', 'Controls', 0, 1000, nothing)  # ×0.01
-
-cv2.namedWindow("Detections",     cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Detections", 1300, 1300)
-
-cv2.namedWindow("Enhanced Gray",   cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Enhanced Gray", 900, 900)
-
-cv2.namedWindow("Threshold Mask",  cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Threshold Mask", 800, 800)
-
-# Static morphology kernel
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, s3))
-
-# ── Main Loop ─────────────────────────────────────────────────────────────────
-try:
-    while True:
-        ret, frame = capture.read()
-        if not ret:
-            break
-
-        # 1) Read all sliders each frame
-        thresh_val = cv2.getTrackbarPos('Thresh',    'Controls')
-        min_area   = cv2.getTrackbarPos('MinArea',   'Controls')
-        max_area   = cv2.getTrackbarPos('MaxArea',   'Controls')
-        clip_limit = cv2.getTrackbarPos('ClipLimit', 'Controls') / 100.0
-
-        # 2) Convert full frame to grayscale once
-        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # 3) Prepare a mask to show all wells' binaries
-        debug_mask = np.zeros_like(gray_full)
-
-        # 4) Per-well processing in parallel
-        with ThreadPoolExecutor() as executor:
+            debug = np.zeros_like(gray)
             tasks = [
-                (
-                    i,
-                    well,
-                    frame_idx,
-                    fps,
-                    frame_width,
-                    frame_height,
-                    gray_full,
-                    clip_limit,
-                    thresh_val,
-                    min_area,
-                    max_area,
-                    kernel,
-                    frame,
-                    debug_mask,
-                    csv_writer,
-                    write_lock
-                )
-                for i, well in enumerate(well_positions)
+                (i, wells[i], t, w, h, gray, cl, tv, ma, xa,
+                 kernel, frame, debug, csv_writer, lock,
+                 (255, 0, 0) if i % 2 else (0, 255, 0)) for i in range(len(wells))
             ]
-            executor.map(lambda args: process_well(*args), tasks)
+            with ThreadPoolExecutor() as ex:
+                ex.map(lambda p: process_well(*p), tasks)
 
-        # 5) Show results
-        cv2.imshow("Enhanced Gray",   gray_full)
-        cv2.imshow("Threshold Mask",  debug_mask)
-        cv2.imshow("Detections",      frame)
+            # show windows
+            enhanced_full = cv2.createCLAHE(clipLimit=cl, tileGridSize=(8,8)).apply(gray)
+            cv2.imshow('Enhanced Gray', enhanced_full)
+            cv2.imshow('Threshold Mask', debug)
 
-        # Move to next frame
-        frame_idx += 1
+            # write and show detections with timestamp overlay
+            out_frame = cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
+            cv2.putText(out_frame, f"Time: {t:.2f}s", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+            out.write(out_frame)
+            cv2.imshow('Detections', out_frame)
 
-        # Exit on key press
-        if cv2.waitKey(1) & 0xFF == ord(exit_key):
-            break
-
-finally:
-    # Release resources
-    csv_file.close()
-    capture.release()
-    cv2.destroyAllWindows()
+            if cv2.waitKey(1) == 27:
+                break
+    finally:
+        csv_file.close()
+        cap.release()
+        out.release()
+        cv2.destroyAllWindows()
