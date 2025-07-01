@@ -7,12 +7,17 @@ from concurrent.futures import ThreadPoolExecutor
 import csv
 import threading
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
+# ─────────────────────────────────────────────────────────────────────────────
 MOVEMENT_THRESHOLD = 1      # Minimum movement in pixels to consider
 FRAME_SKIP = 9              # Number of frames to skip between processed frames
 
-# Detect circular wells in the static arena
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility functions
+# ─────────────────────────────────────────────────────────────────────────────
 def detect_wells(frame):
+    """Detect (x, y, r) for circular wells in a static arena."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.medianBlur(gray, 5)
     circles = cv2.HoughCircles(
@@ -25,10 +30,40 @@ def detect_wells(frame):
     if circles is not None:
         circles = np.uint16(np.around(circles))
         for x, y, r in circles[0]:
-            wells.append((x, y, r))
+            wells.append((int(x), int(y), int(r)))
     return wells
 
-# Draw bounding box, well circle, and ID label
+def order_wells_rowwise(wells, tol_factor=0.5):
+    """
+    Return wells sorted top-to-bottom, left-to-right.
+    Rows are detected by clustering y-coordinates with a tolerance proportional
+    to the median radius.  This survives moderate camera tilt.
+    """
+    if not wells:
+        return wells
+
+    # 1. Sort by y so potential neighbours are adjacent
+    wells_sorted = sorted(wells, key=lambda c: c[1])
+
+    # 2. Cluster into rows
+    tol = np.median([r for _, _, r in wells_sorted]) * tol_factor
+    rows = []
+    for c in wells_sorted:
+        for row in rows:
+            if abs(c[1] - row[0][1]) < tol:  # same row
+                row.append(c)
+                break
+        else:
+            rows.append([c])  # start new row
+
+    # 3. Sort each row left-to-right
+    for row in rows:
+        row.sort(key=lambda c: c[0])
+
+    # 4. Flatten back to a single list
+    ordered = [c for row in rows for c in row]
+    return ordered
+
 def draw_detection_box(frame, well_idx, x0, y0, contour, cx, cy, r, color):
     x, y, w_, h_ = cv2.boundingRect(contour)
     cv2.rectangle(frame, (x0 + x, y0 + y), (x0 + x + w_, y0 + y + h_), color, 2)
@@ -36,14 +71,14 @@ def draw_detection_box(frame, well_idx, x0, y0, contour, cx, cy, r, color):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     cv2.circle(frame, (cx, cy), r, (0, 255, 255), 2)  # high-contrast yellow circle
 
-# Euclidean distance
 def calculate_distance(x1, y1, x2, y2):
+    """Euclidean distance."""
     return math.hypot(x2 - x1, y2 - y1)
 
-# Process a single well for one frame
 def process_well(well_idx, well, t, frame_w, frame_h,
                  gray_full, clip_limit, thresh_val, min_area, max_area,
                  kernel, frame, debug_mask, csv_writer, write_lock, color):
+    """Process one well for a single frame (runs inside ThreadPool)."""
     global well_tracks, csv_file
     cx, cy, r = well
     x0, y0 = cx - r, cy - r
@@ -52,7 +87,7 @@ def process_well(well_idx, well, t, frame_w, frame_h,
     roi = gray_full[y0c:y1c, x0c:x1c]
 
     # CLAHE enhancement
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
     enhanced = clahe.apply(roi)
 
     # threshold
@@ -96,13 +131,13 @@ def process_well(well_idx, well, t, frame_w, frame_h,
     abs_x = int(x0c + cb)
     abs_y = int(y0c + cb2)
 
-    # distance
+    # distance travelled since last frame
     prev_full = well_tracks[well_idx]['last_full']
     dist = calculate_distance(prev_full[0], prev_full[1], abs_x, abs_y) if prev_full else 0.0
     well_tracks[well_idx]['last_full'] = (abs_x, abs_y)
     well_tracks[well_idx]['last_centroid'] = (cb, cb2)
 
-    # write csv with timestamp
+    # write csv
     with write_lock:
         csv_writer.writerow([well_idx, f"{t:.2f}", f"{dist:.2f}"])
         csv_file.flush()
@@ -113,21 +148,32 @@ def process_well(well_idx, well, t, frame_w, frame_h,
     if cnts:
         draw_detection_box(frame, well_idx, x0c, y0c, cnts[0], cx, cy, r, color)
 
-# Setup
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     video_path = r"C:\Users\federico97\Desktop\Adrian_heterostegina-depressa\full_1frame_per_minute.mp4"
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened(): raise RuntimeError(f"Cannot open {video_path}")
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open {video_path}")
     ret, first = cap.read()
-    if not ret: raise RuntimeError("Cannot read first frame")
+    if not ret:
+        raise RuntimeError("Cannot read first frame")
 
+    # 1. Detect wells
     wells = detect_wells(first)
-    if not wells: raise RuntimeError("No wells found")
+    if not wells:
+        raise RuntimeError("No wells found")
+
+    # 2. Re-order wells so indices increase row-wise (top-left → bottom-right)
+    wells = order_wells_rowwise(wells)
+
+    # 3. Continue as usual
     h, w = first.shape[:2]
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # track state
-    well_tracks = {i: {'last_centroid': None, 'last_full': None} for i in range(len(wells))}
+    well_tracks = {i: {'last_centroid': None, 'last_full': None}
+                   for i in range(len(wells))}
 
     # CSV
     csv_file = open('well_distances.csv', 'w', newline='')
@@ -135,11 +181,14 @@ if __name__ == '__main__':
     csv_writer.writerow(['well', 'time_s', 'distance_px'])
     lock = threading.Lock()
 
-    # video writer
+    # Video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('tracked_output.mp4', fourcc, fps/(FRAME_SKIP+1), (w, h))
+    out = cv2.VideoWriter('tracked_output.mp4',
+                          fourcc,
+                          fps / (FRAME_SKIP + 1),
+                          (w, h))
 
-    # windows
+    # GUI controls
     cv2.namedWindow('Controls', cv2.WINDOW_NORMAL)
     def nothing(x): pass
     cv2.createTrackbar('Thresh', 'Controls', 9, 255, nothing)
@@ -151,23 +200,27 @@ if __name__ == '__main__':
     cv2.namedWindow('Threshold Mask', cv2.WINDOW_NORMAL)
     cv2.namedWindow('Detections', cv2.WINDOW_NORMAL)
 
-    # static overlay
+    # Static overlay with ordered indices
     overlay = np.zeros_like(first)
     for idx, (cx, cy, r) in enumerate(wells):
         cv2.circle(overlay, (cx, cy), r, (0, 255, 255), 2)
         cv2.putText(overlay, str(idx), (cx - 10, cy + 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     try:
         while True:
-            for _ in range(FRAME_SKIP): cap.grab()
+            # Skip frames to reduce processing load
+            for _ in range(FRAME_SKIP):
+                cap.grab()
             ret, frame = cap.read()
-            if not ret: break
-            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if not ret:
+                break
+            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0  # seconds
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # read controls
+            # Current GUI settings
             tv = cv2.getTrackbarPos('Thresh', 'Controls')
             ma = cv2.getTrackbarPos('MinArea', 'Controls')
             xa = cv2.getTrackbarPos('MaxArea', 'Controls')
@@ -177,24 +230,29 @@ if __name__ == '__main__':
             tasks = [
                 (i, wells[i], t, w, h, gray, cl, tv, ma, xa,
                  kernel, frame, debug, csv_writer, lock,
-                 (255, 0, 0) if i % 2 else (0, 255, 0)) for i in range(len(wells))
+                 (255, 0, 0) if i % 2 else (0, 255, 0))
+                for i in range(len(wells))
             ]
+
+            # Parallel processing
             with ThreadPoolExecutor() as ex:
                 ex.map(lambda p: process_well(*p), tasks)
 
-            # show windows
-            enhanced_full = cv2.createCLAHE(clipLimit=cl, tileGridSize=(8,8)).apply(gray)
+            # Show intermediate windows
+            enhanced_full = cv2.createCLAHE(
+                clipLimit=cl, tileGridSize=(8, 8)
+            ).apply(gray)
             cv2.imshow('Enhanced Gray', enhanced_full)
             cv2.imshow('Threshold Mask', debug)
 
-            # write and show detections with timestamp overlay
+            # Write and show detections with timestamp
             out_frame = cv2.addWeighted(frame, 1.0, overlay, 0.5, 0)
             cv2.putText(out_frame, f"Time: {t:.2f}s", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             out.write(out_frame)
             cv2.imshow('Detections', out_frame)
 
-            if cv2.waitKey(1) == 27:
+            if cv2.waitKey(1) == 27:  # ESC to quit
                 break
     finally:
         csv_file.close()
